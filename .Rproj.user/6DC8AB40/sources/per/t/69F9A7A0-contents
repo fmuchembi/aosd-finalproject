@@ -1,0 +1,153 @@
+library(rgee)
+
+# Initialize Earth Engine
+ee_Initialize()
+
+# Load project area
+project_area <- ee$FeatureCollection("projects/ee-fmuchembi/assets/project_area")
+
+
+s2 <- ee$ImageCollection("COPERNICUS/S2_SR")$
+  filterBounds(project_area)$
+  filterDate('2017-01-01', '2023-12-31')$
+  filter(ee$Filter$lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+
+
+world_cover <- ee$Image("ESA/WorldCover/v200/2021")$select('Map')
+urban_mask <- world_cover$eq(50)  
+water_mask <- world_cover$eq(60)
+
+
+calculate_nbr <- function(image) {
+  nbr <- image$normalizedDifference(c('B8', 'B12'))$rename('NBR')
+  return(image$addBands(nbr))
+}
+
+# Apply NBR function to Sentinel-2 data
+s2_with_nbr <- s2$map(calculate_nbr)
+
+# Threshold to detect bare ground
+bare_threshold <- 0.2
+
+# Function to classify bare ground
+detect_bareground <- function(image) {
+  bare_ground <- image$select('NBR')$lt(bare_threshold)$rename('BareGround')
+  return(bare_ground$
+           updateMask(urban_mask$Not())$
+           updateMask(water_mask$Not()))
+}
+
+# Apply bare ground detection & exclude urban/water areas
+bareground_images <- s2_with_nbr$map(detect_bareground)
+
+# Compute frequency of bare ground occurrence
+bareground_frequency <- bareground_images$
+  sum()$
+  divide(bareground_images$count())$
+  multiply(100)$
+  clip(project_area)
+
+# Export to Google Earth Engine assets
+tryCatch({
+  # Define the export task to save to your GEE assets
+  task <- ee$batch$Export$image$toAsset(
+    image = bareground_frequency,
+    description = 'bareground_frequency',
+    assetId = 'projects/ee-fmuchembi/assets/bareground_frequency', 
+    region = project_area$geometry(),
+    scale = 30,
+    maxPixels = 1e13
+  )
+  # Start the export task
+  task$start()
+  
+  message("Exporting to GEE assets.")
+  
+}, error = function(e) {
+  message("Layer not saved: ", e$message)
+})
+
+
+
+library(terra)
+
+
+bareground<- "/home/brian/Desktop/r-application/restoration_suitability_areas.tif"
+
+
+bare_ground_raster <- rast(bareground)
+
+
+plot(bare_ground_raster, 
+     main = "Restoration potential  Areas", 
+     col = terrain.colors(100))
+
+
+
+
+library(terra)
+library(tmap)
+
+# Load raster
+file_path <- "/home/brian/Desktop/r-application/bare_ground_frequency.tif"
+bare_ground_raster <- rast(file_path)
+
+# Convert raster to SpatRaster for tmap
+tm_shape(bare_ground_raster) +
+  tm_raster(title = "Bare Ground (%)") +  # Legend title
+  tm_layout(main.title = "Bare Ground Frequency", 
+            legend.outside = TRUE)
+
+
+
+library(terra)
+library(tmap)
+
+# Load raster
+file_path <- "/home/brian/Desktop/r-application/bare_ground_frequency.tif"
+bare_ground_raster <- rast(file_path)
+
+# Define color palette (NDVI-like: green for low bare ground, red for high)
+colors <- c("#008000", "#ADFF2F", "#FFFF00", "#FFA500", "#FF0000")  # Green to red
+
+# Convert raster to SpatRaster for tmap
+tm_shape(bare_ground_raster) +
+  tm_raster(title = "Bare Ground (%)",
+            palette = colors,  # Apply NDVI-like color scale
+            style = "cont",         # Continuous scale
+            breaks = c(0, 20, 40, 60, 80, 100)) +  # Define class breaks
+  tm_layout(main.title = "Bare Ground Frequency", 
+            legend.position = c("right", "center"))  # Legend on the right
+
+
+
+
+
+library(terra)
+library(tmap)
+
+# Load raster
+file_path <- "/home/brian/Desktop/r-application/bare_ground_frequency.tif"
+bare_ground_raster <- rast(file_path)
+
+# Define color palette (NDVI-like: green for low bare ground, red for high)
+ndvi_colors <- c("#008000", "#ADFF2F", "#FFFF00", "#FFA500", "#FF0000")  # Green to red
+
+# Convert raster to SpatRaster for tmap
+tm_shape(bare_ground_raster) +
+  tm_raster(title = "Bare Ground (%)",
+            palette = ndvi_colors,  
+            style = "cont",         
+            breaks = c(0, 20, 40, 60, 80, 100)) +  
+  tm_layout(main.title = "Bare Ground Frequency", 
+            legend.outside = TRUE,        # Moves legend outside
+            legend.outside.position = "right")  # Positions legend to the right
+
+
+
+
+     
+
+
+
+

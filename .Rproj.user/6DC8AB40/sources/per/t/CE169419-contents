@@ -1,0 +1,93 @@
+library(rgee)
+library(dplyr)
+
+
+# Initialize Earth Engine
+ee_Initialize()
+
+
+project_area <-  ee$FeatureCollection("projects/ee-fmuchembi/assets/project_area")
+conservancies <- ee$FeatureCollection("projects/ee-fmuchembi/assets/protected_areas")
+bareground_frequency <- ee$Image("projects/ee-fmuchembi/assets/bareground_frequency")
+referenceFC <- ee$FeatureCollection("projects/ee-fmuchembi/assets/reference")
+activeFC <- ee$FeatureCollection("projects/ee-fmuchembi/assets/active-zone")
+
+
+
+elevation <- ee$Image("USGS/SRTMGL1_003")
+slope <- ee$Terrain$slope(elevation)
+bare_ground_mask <- bareground_frequency$gte(50)$And(bareground_frequency$lte(60))
+filtered_bare_ground <- bareground_frequency$updateMask(bare_ground_mask)
+conservancy_mask <- conservancies$
+  map(function(feature) {
+    feature$set('value', 1)
+  })$
+  reduceToImage(
+    properties = list('value'),
+    reducer = ee$Reducer$first()
+  )$
+  unmask(0)$
+  Not()
+
+potential_restoration <- filtered_bare_ground$updateMask(conservancy_mask)
+
+slope_mask <- slope$lt(15) 
+final_restoration_areas <- potential_restoration$updateMask(slope_mask)
+
+final_restoration_areas <- final_restoration_areas$clip(project_area)
+
+active_samples <- activeFC$map(function(feature) {
+  feature$set('class', 1)
+})
+
+reference_samples <- referenceFC$map(function(feature) {
+  feature$set('class', 0)
+})
+
+# Merge Training Data
+training_data <- active_samples$merge(reference_samples)
+
+# Sample the Image for Training
+training_samples <- final_restoration_areas$sampleRegions(
+  collection = training_data,
+  properties = list('class'),
+  scale = 30
+)
+
+# Train the Random Forest Model
+classifier <- ee$Classifier$smileRandomForest(50)$train(
+  features = training_samples,
+  classProperty = 'class'
+)
+
+# Predict Restoration Suitability
+prediction <- final_restoration_areas$classify(classifier)
+
+
+tryCatch({
+  # Define the export task to save to your GEE assets
+  task <- ee$batch$Export$image$toAsset(
+    image = prediction,
+    description = 'restoration_suitability_areas',
+    assetId = 'projects/ee-fmuchembi/assets/restoration_suitability_areas', 
+    region = project_area$geometry(),
+    scale = 30,
+    maxPixels = 1e13
+  )
+  
+  # Start the export task
+  task$start()
+  
+  message("Exporting to GEE assets.")
+  
+}, error = function(e) {
+  message("Layer not saved: ", e$message)
+})
+
+
+# Print completion message
+message("Random Forest Prediction Completed!")
+
+
+
+

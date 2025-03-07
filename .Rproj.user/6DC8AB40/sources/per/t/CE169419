@@ -1,0 +1,26 @@
+{
+    "id": "CE169419",
+    "path": "~/Desktop/r-application/predict-expoundable-areas.R",
+    "project_path": "predict-expoundable-areas.R",
+    "type": "r_source",
+    "hash": "2655973706",
+    "contents": "",
+    "dirty": false,
+    "created": 1741345145671.0,
+    "source_on_save": false,
+    "relative_order": 7,
+    "properties": {
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "18,46",
+        "scrollLine": "10"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1741333911,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1741333911,
+    "read_only": false,
+    "read_only_alternatives": []
+}

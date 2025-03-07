@@ -1,0 +1,471 @@
+
+library(rgee)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(stringr)
+library(shiny)
+library(shinydashboard)
+library(leaflet)
+library(sf)
+
+# Try to initialize Earth Engine with error handling
+tryCatch({
+  # Initialize Earth Engine only once here, not in server.R
+  ee_Initialize()  # Try the default initialization first
+}, error = function(e) {
+  # If the default initialization fails, log the error
+  message("Default Earth Engine initialization failed: ", e$message)
+  
+  # Try with specific Python environment as fallback
+  tryCatch({
+    ee_Initialize(py_env = '/opt/rgee')
+  }, error = function(e2) {
+    # If both methods fail, provide a more informative error
+    stop("Earth Engine initialization failed. Please check your Earth Engine and Python setup: ", e2$message)
+  })
+})
+
+# Data paths
+project_area <- 'projects/ee-fmuchembi/assets/project_area'
+asset_folder <- 'projects/ee-fmuchembi/assets/jdi_npp_files'
+active_asset_folder <- 'projects/ee-fmuchembi/assets/active-zone'
+control_asset_folder <- 'projects/ee-fmuchembi/assets/reference'
+
+# Seasonal parameter to control which season to analyze Options: "short_rains", "long_rains", "after_long_rains"
+selected_season <- "short_rains"  
+
+# Time parameters
+startYear <- 2008
+endYear <- year(Sys.Date()) + 1
+
+# Function to list NPP assets in a folder 
+list_npp_assets <- function(folder) {
+  assets <- ee$data$listAssets(list(parent = folder))
+  asset_ids <- sapply(assets$assets, function(asset) asset$id)
+  return(asset_ids)
+}
+
+# Function to convert dekadal period to date
+# Example of NPP asset WAPOR-2_L2-NPP-D_2009-01-D1
+get_dekadal_date <- function(asset_id) {
+  match <- str_match(asset_id, "_([0-9]{4}-[0-9]{2})-D([1-3])_")
+  
+  if(is.na(match[1])) {
+    print(paste("Could not parse date from asset ID:", asset_id))
+    return(NA)
+  }
+  
+  year_month <- match[2]
+  dekad <- match[3]
+  
+  year <- as.numeric(substr(year_month, 1, 4))
+  month <- as.numeric(substr(year_month, 6, 7))
+  day <- 1
+  if (dekad == '2') day <- 11
+  if (dekad == '3') day <- 21
+  
+  return(ymd(paste0(year, "-", month, "-", day)))
+}
+
+# Extract NPP data for the specified feature collection for a season
+extract_npp_data <- function(feature_collection, label) {
+  asset_ids <- list_npp_assets(asset_folder)
+  data <- data.frame(year = integer(), season = character(), NPP = numeric(), label = character())
+  
+  total_assets <- length(asset_ids)
+  seasonal_assets <- 0
+  processed_assets <- 0
+  
+  for (asset_id in asset_ids) {
+    date <- get_dekadal_date(asset_id)
+    
+    if(is.na(date)) {
+      next
+    }
+    
+    # Check if the date is within our seasonal date range
+    month_val <- month(date)
+    year_val <- year(date)
+    
+    is_in_season <- FALSE
+    if (selected_season == "short_rains") {
+      # Short rains: Oct-Feb
+      is_in_season <- (month_val >= 10 && month_val <= 12) || 
+        (month_val >= 1 && month_val <= 2)
+    } else if (selected_season == "long_rains") {
+      # Long rains: Feb-Jun
+      is_in_season <- month_val >= 2 && month_val <= 6
+    } else if (selected_season == "after_long_rains") {
+      # After long rains: Jul-Aug
+      is_in_season <- month_val >= 7 && month_val <= 8
+    }
+    
+    if (is_in_season) {
+      seasonal_assets <- seasonal_assets + 1
+      
+      npp_image <- ee$Image(asset_id)
+      mean_npp <- npp_image$reduceRegion(
+        reducer = ee$Reducer$mean(),
+        geometry = feature_collection$geometry(),
+        scale = 100,
+        bestEffort = TRUE
+      )
+      
+      npp_value <- mean_npp$get('b1')$getInfo()
+      
+      if(!is.null(npp_value) && !is.na(npp_value)) {
+        processed_assets <- processed_assets + 1
+        
+        # Append the data to the data frame
+        data <- rbind(data, data.frame(
+          year = year_val,
+          season = selected_season,
+          NPP = npp_value,
+          label = label
+        ))
+      }
+    }
+  }
+  
+  # Aggregate the mean NPP by year
+  if(nrow(data) > 0) {
+    df <- data %>%
+      group_by(year, season, label) %>%
+      summarise(NPP = mean(NPP, na.rm = TRUE), .groups = 'drop')
+    
+    return(df)
+  } 
+}
+
+# Function to list control and reference zones
+list_feature_collection_assets <- function(asset_path) {
+  fc <- ee$FeatureCollection(asset_path)
+  features <- fc$getInfo()$features
+  # get the 'name_1' property from each feature
+  names <- sapply(features, function(feature) feature$properties$name_1)
+  
+  return(names)
+}
+
+# LST
+generateRegionChart <- function(feature, region_name) {
+  activeFeature <- ee$FeatureCollection(active_asset_folder)$filter(ee$Filter$eq('name_1', region_name))$first()
+  if (is.null(activeFeature)) {
+    cat('No matching active zone for:', region_name, '\n')
+    return(NULL)
+  }
+  
+  # Get MODIS LST dataset (MOD11A2 - 8-day LST)
+  modisLST <- ee$ImageCollection("MODIS/061/MOD11A2")$
+    filterDate('2001-01-01', '2023-12-31')$
+    select('LST_Day_1km') 
+  
+  # Convert measurements from Kelvin to Celsius
+  convertToCelsius <- function(img) {
+    img$multiply(0.02)$subtract(273.15)$
+      copyProperties(img, list('system:time_start'))
+  }
+  lstCelsius <- modisLST$map(convertToCelsius)
+  
+  # Process year by year
+  years_list <- 2001:2023
+  annualLST_list <- list()
+  
+  for (year in years_list) {
+    yearlyLST <- lstCelsius$
+      filter(ee$Filter$calendarRange(year, year, 'year'))$
+      mean()
+    
+    timeBand <- ee$Image$constant(year - 2000)$rename('year')
+    
+    result_img <- yearlyLST$
+      addBands(timeBand)$
+      set('year', year)$
+      set('system:time_start', ee$Date$fromYMD(year, 6, 1))
+    
+    annualLST_list[[length(annualLST_list) + 1]] <- result_img
+  }
+  
+  annualLSTCollection <- ee$ImageCollection(annualLST_list)
+  
+  # Create data extraction function for reference zone
+  extractReferenceData <- function(image) {
+    mean <- image$reduceRegion(
+      reducer = ee$Reducer$mean(),
+      geometry = feature$geometry(),
+      scale = 1000,
+      maxPixels = 1e9
+    )
+    
+    ee$Feature(
+      NULL, 
+      list(
+        'LST' = mean$get('LST_Day_1km'),
+        'year' = image$get('year'),
+        'system:time_start' = image$get('system:time_start'),
+        'zone' = 'Reference'
+      )
+    )
+  }
+  
+  # Create data extraction function for active zone
+  extractActiveData <- function(image) {
+    mean <- image$reduceRegion(
+      reducer = ee$Reducer$mean(),
+      geometry = activeFeature$geometry(),
+      scale = 1000,
+      maxPixels = 1e9
+    )
+    
+    ee$Feature(
+      NULL, 
+      list(
+        'LST' = mean$get('LST_Day_1km'),
+        'year' = image$get('year'),
+        'system:time_start' = image$get('system:time_start'),
+        'zone' = 'Active'
+      )
+    )
+  }
+  
+  # Get reference and active data
+  referenceValues <- annualLSTCollection$map(extractReferenceData)
+  activeValues <- annualLSTCollection$map(extractActiveData)
+  
+  # Combine data
+  combinedData <- referenceValues$merge(activeValues)
+  
+  # Extract data to R dataframe
+  tryCatch({
+    lst_list <- ee_utils_py_to_r(combinedData$aggregate_array("LST")$getInfo())
+    zone_list <- ee_utils_py_to_r(combinedData$aggregate_array("zone")$getInfo())
+    year_list <- ee_utils_py_to_r(combinedData$aggregate_array("year")$getInfo())
+    
+    # Check if any of these are NULL or empty
+    if (length(lst_list) == 0 || length(zone_list) == 0 || length(year_list) == 0) {
+      cat("Empty data for region:", region_name, "\n")
+      return(NULL)
+    }
+    
+    # Create dataframe
+    combined_df <- data.frame(
+      LST = as.numeric(unlist(lst_list)),
+      zone = unlist(zone_list),
+      year = as.numeric(unlist(year_list))
+    )
+    
+    # Create plot
+    p <- ggplot(combined_df, aes(x=year, y=LST, color=zone, group=zone)) +
+      geom_line(linewidth=1) +
+      geom_point(size=3) +
+      scale_color_manual(values=c("Reference"="blue", "Active"="red")) +
+      labs(
+        title = paste0(region_name, " - LST Measurements Comparison"),
+        x = "Year",
+        y = "LST (°C)"
+      ) +
+      theme_minimal()
+    
+    return(p)
+  }, error = function(e) {
+    cat("Error processing region:", region_name, "-", e$message, "\n")
+    return(NULL)
+  })
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ## Analyze the  bare ground Frrequency
+#   #Load Sentinel-2 Surface Reflectance dataset
+#   s2 <- ee$ImageCollection("COPERNICUS/S2_SR")$
+#     filterBounds(project_area)$
+#     filterDate('2017-01-01', '2023-12-31')$
+#     filter(ee$Filter$lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+#   
+#   # ESA WorldCover 2021 to mask urban areas & water
+#   world_cover <- ee$Image("ESA/WorldCover/v200/2021")$select('Map')
+#   urban_mask <- world_cover$eq(50)  
+#   water_mask <- world_cover$eq(60)
+#   
+#   # Calculate Normalized Burn Ratio (NBR) for bare ground detection
+#   calculate_nbr <- function(image) {
+#     nbr <- image$normalizedDifference(c('B8', 'B12'))$rename('NBR')
+#     return(image$addBands(nbr))
+#   }
+#   
+#   # NBR function to Sentinel-2 data
+#   s2_with_nbr <- s2$map(calculate_nbr)
+#   
+#   # Threshold to detect bareground
+#   bare_threshold <- 0.2
+#   
+#   # Function to classify bare ground
+#   detect_bareground <- function(image) {
+#     bare_ground <- image$select('NBR')$lt(bare_threshold)$rename('BareGround')
+#     return(bare_ground$
+#              updateMask(urban_mask$Not())$
+#              updateMask(water_mask$Not()))
+#   }
+#   
+#   # Apply bare ground detection & exclude urban/water areas
+#   bareground_images <- s2_with_nbr$map(detect_bareground)
+#   
+#   # Compute frequency of bare ground occurrence
+#   bareground_frequency <- bareground_images$
+#     sum()$
+#     divide(bareground_images$count())$
+#     multiply(100)$
+#     clip(project_area)
+#   
+#   # Export to Google Earth Engine assets
+#   # tryCatch({
+#   #   # Define the export task to save to your GEE assets
+#   #   task <- ee$batch$Export$image$toAsset(
+#   #     image = bareground_frequency,
+#   #     description = 'bareground_frequency',
+#   #     assetId = 'projects/ee-fmuchembi/assets/bareground_frequency', 
+#   #     region = project_area$geometry(),
+#   #     scale = 30,
+#   #     maxPixels = 1e13
+#   #   )
+#   #   # Start the export task
+#   #   task$start()
+#   #   
+#   #   message("Exporting to GEE assets.")
+#   #   
+#   # }, error = function(e) {
+#   #   message("Layer not saved: ", e$message)
+#   # })
+#   
+#   # Using Random Forest to predict places for expansion
+#   conservancies <- ee$FeatureCollection("projects/ee-fmuchembi/assets/protected_areas")
+#   # Load Elevation Data (SRTM)
+#   elevation <- ee$Image("USGS/SRTMGL1_003")
+#   
+#   # Compute Slope from Elevation
+#   slope <- ee$Terrain$slope(elevation)
+#   
+#   #Bareground mask
+#   bare_ground_mask <- bareground_frequency$gte(30)$And(bareground_frequency$lte(60))
+#   filtered_bare_ground <- bareground_frequency$updateMask(bare_ground_mask)
+#   
+#   
+#   # Conservancies Exclude
+#   conservancy_mask <- conservancies$
+#     map(function(feature) {
+#       feature$set('value', 1)
+#     })$
+#     reduceToImage(
+#       properties = list('value'),
+#       reducer = ee$Reducer$first()
+#     )$
+#     unmask(0)$
+#     Not()
+#   
+#   # Apply Conservancy Mask to Bare Ground
+#   potential_restoration <- filtered_bare_ground$updateMask(conservancy_mask)
+#   
+#   # Slope Constraint remove Steep Slopes
+#   slope_mask <- slope$lt(15) 
+#   final_restoration_areas <- potential_restoration$updateMask(slope_mask)
+#   
+#   
+#   final_restoration_areas <- final_restoration_areas$clip(project_area)
+#   
+#   # Combine Features for Training (Active = 1, Reference = 0)
+#   active_samples <- activeFC$map(function(feature) {
+#     feature$set('class', 1)
+#   })
+#   
+#   reference_samples <- referenceFC$map(function(feature) {
+#     feature$set('class', 0)
+#   })
+#   
+#   # Merge Training Data
+#   training_data <- active_samples$merge(reference_samples)
+#   
+#   # Sample the Image for Training
+#   training_samples <- final_restoration_areas$sampleRegions(
+#     collection = training_data,
+#     properties = list('class'),
+#     scale = 30
+#   )
+#   
+#   # Train the Random Forest Model
+#   classifier <- ee$Classifier$smileRandomForest(50)$train(
+#     features = training_samples,
+#     classProperty = 'class'
+#   )
+#   
+#   # Predict Restoration Suitability
+#   prediction <- final_restoration_areas$classify(classifier)
+#   
+#   
+#   #tryCatch({
+#   # Define the export task to save to your GEE assets
+#   # task <- ee$batch$Export$image$toAsset(
+#   #     image = prediction,
+#   #     description = 'restoration_suitability_areas',
+#   #     assetId = 'projects/ee-fmuchembi/assets/restoration_suitability_areas', 
+#   #     region = project_area$geometry(),
+#   #     scale = 30,
+#   #     maxPixels = 1e13
+#   #   )
+#   #   
+#   #   # Start the export task
+#   #   task$start()
+#   #   
+#   #   message("Exporting to GEE assets.")
+#   #   
+#   # }, error = function(e) {
+#   #   message("Layer not saved: ", e$message)
+#   # })
+#   
+#   
+#   # Print completion message
+#   message("Random Forest Prediction Completed!")
+
+
+
+
+
+
+
+
