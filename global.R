@@ -9,22 +9,17 @@ library(shinydashboard)
 library(leaflet)
 library(sf)
 
-# Try to initialize Earth Engine with error handling
-tryCatch({
-  # Initialize Earth Engine only once here, not in server.R
-  ee_Initialize()  # Try the default initialization first
-}, error = function(e) {
-  # If the default initialization fails, log the error
-  message("Default Earth Engine initialization failed: ", e$message)
-  
-  # Try with specific Python environment as fallback
-  tryCatch({
-    ee_Initialize(py_env = '/opt/rgee')
-  }, error = function(e2) {
-    # If both methods fail, provide a more informative error
-    stop("Earth Engine initialization failed. Please check your Earth Engine and Python setup: ", e2$message)
-  })
-})
+library(geojsonio)
+
+library(reticulate)
+use_condaenv("gee") 
+
+py_config()
+
+
+# auth using personal email accounts
+ee_Initialize()
+
 
 # Data paths
 project_area <- 'projects/ee-fmuchembi/assets/project_area'
